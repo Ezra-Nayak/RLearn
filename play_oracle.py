@@ -148,10 +148,21 @@ def plan_best_action(env, lookahead_steps=12, sim_env=None):
     random.setstate(rand_state)
 
     if best_path:
-        return best_path[0]
+        act = best_path[0]
     elif best_survival_path:
-        return best_survival_path[0]
-    return 3  # Default fallback to Idle
+        act = best_survival_path[0]
+    else:
+        act = 3  # Default fallback to Idle
+
+    # Enforce boundary masking safety:
+    # If the planner attempts to move Left/Right past the grid boundaries,
+    # collapse the action to Idle to align with the active environment mask.
+    if act == 1 and env.player_x <= env.GRID_MIN_X:
+        act = 3
+    elif act == 2 and env.player_x >= env.GRID_MAX_X:
+        act = 3
+
+    return act
 
 
 def main():

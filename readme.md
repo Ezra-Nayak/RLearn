@@ -71,6 +71,7 @@ To convert the spatial latents into discrete motor actions, the $128$-channel, $
 * **CoordConv Injection**: Convolutional networks are spatially translation-invariant, which prevents standard CNNs from identifying absolute grid positions. To correct this, the policy procedurally generates linear normalized $X$ and $Y$ coordinate grids and appends them to the latent map. This expands the input from $128$ to $130$ channels, providing the Conv2D layers with precise spatial coordinates.
 * **Disjoint Networks**: To prevent destructive gradient interference between policy and value predictions, the Actor and Critic heads utilize entirely disjoint linear-layer pathings.
 * **Action Masking**: The environments calculate explicit masks to restrict lateral boundaries. These masks are added directly to the raw actor logits before evaluating standard categorical distributions, preventing out-of-bounds exploration.
+* **Joint Policy-Value Imitation Bootstrapping (Behavioral Cloning)**: To bypass the early exploration barrier of reinforcement learning, the network undergoes supervised pretraining. It jointly learns the Actor's optimal action distribution (via CrossEntropy) and the Critic's value estimation of states (via MSE over normalized episodic returns). To prevent unstable state-value variance from destabilizing representation learning, the feature extractor gradients are detached from the Critic head during supervised pretraining.
 
 ---
 
@@ -142,10 +143,18 @@ An interactive diagnostic tool designed to let you manually play the simulation.
 * **State Diagnostics**: Overlays a visual dashboard showing real-time metrics, active scores, cumulative rewards, step numbers, and collision warnings.
 
 ### `play_oracle.py`
-An automated solver script showcasing perfect pathing decisions via real-time search.
+An automated solver script showcasing optimal pathing decisions via real-time search.
 * **Time-Expanded Grid Search**: Simulates paths in a time-expanded search tree. By collapsing search states down to `(player_x, player_z)` keys per depth level, the planner prunes $4^d$ tree branches to $\approx 1,400$ nodes for a 12-step lookahead.
 * **State Isolation**: Captures and restores the environment and pseudo-random seed state during branching simulations, guaranteeing deterministic lookahead predictions without disrupting the main visual rollout.
 * **Multi-Objective Survival Planner**: Evaluates branches based on forward progress, minimal time-to-reach, and falls back to a maximum-survival path if a collision is unavoidable.
+* **Boundary-Masking Safety Override**: Enforces coordinate-level masking directly inside the solver. If the lookahead search yields a lateral movement that exceeds the grid boundary (which would act as a stationary "Idle" move but conflict with the environment's active action mask), it collapses the action to `3` (Idle) to prevent training-loss gradient explosions during supervised pretraining.
+
+### `train_bc.py`
+A high-throughput, joint policy-value supervised pretraining suite (Behavioral Cloning).
+* **Parallel CPU Harvesting**: Distributes independent raw trajectory generation across a multiprocessing pool (`ProcessPoolExecutor`), bypassing single-threaded Python bottlenecks and capturing thousands of expert transitions per minute.
+* **Batched GPU Latent Encoding**: Decouples search simulation from neural rendering. Once CPU workers harvest raw environment frames, the main process gathers them into batches of 128 and processes them through the frozen `SpatialVQVAE` on the GPU in seconds.
+* **Joint Policy-Value Supervised Objective**: Minimizes the combined error of the Actor (CrossEntropy action classification) and the Critic (Mean Squared Error over normalized returns). Detaches CNN features from the Critic's backpropagation path to keep policy representations stable.
+* **Warm Start Resuming**: Generates the initialized checkpoint `checkpoints/ppo_sim_bc.pth`. When standard vectorized PPO is executed, the core loop detects and loads these weights to bootstrap training performance.
 
 ### `decode_ppo_sim.py`
 A diagnostics tool that serves as a simulated fMRI brain scanner for your trained agent.
@@ -173,3 +182,5 @@ The table below outlines the default training configurations and data structures
 | **ActorCritic** | Conv Layer Input | `130` channels | 128 VAE channels + 2 coordinate grids (CoordConv) |
 | **ActorCritic** | Output Layer | `4` discrete logits | [Up, Left, Right, Idle] action choices |
 | **play_oracle.py** | `lookahead_steps` | `12` | Planning horizon depth for optimal pathing decisions |
+| **train_bc.py** | `TARGET_STEPS` | `15,000` | Sample threshold of optimal transitions collected in memory |
+| **train_bc.py** | `EPOCHS` | `25` | Supervised training epochs for policy-value bootstrapping |

@@ -16,7 +16,7 @@ from play_oracle import plan_best_action
 CHECKPOINT_DIR = "checkpoints"
 TARGET_STEPS = 15000
 BATCH_SIZE = 128
-EPOCHS = 15
+EPOCHS = 25  # Increased training epochs from 15 to 25
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 
@@ -207,6 +207,19 @@ def train_behavioral_cloning():
             # does not backpropagate and ruin the BC representation learned by the Actor.
             state_values = model.critic(features.detach()).squeeze(-1)
 
+            # FORCE 1D SHAPES TO PREVENT SILENT BROADCASTING
+            state_values = state_values.reshape(-1)
+            returns = returns.reshape(-1)
+
+            # One-time first batch shape/normalization diagnostic verification
+            if epoch == 1 and total_train == 0:
+                print(f"\n[DEBUG] Epoch 1 First Batch Diagnostics:")
+                print(
+                    f"  * state_values: shape={state_values.shape}, mean={state_values.mean().item():.4f}, std={state_values.std().item():.4f}")
+                print(
+                    f"  * returns:      shape={returns.shape}, mean={returns.mean().item():.4f}, std={returns.std().item():.4f}")
+                print(f"  * sample returns: {returns[:5].tolist()}")
+
             masked_logits = action_logits + masks
 
             loss_actor = actor_criterion(masked_logits, actions)
@@ -238,6 +251,10 @@ def train_behavioral_cloning():
                 features = model._get_features(latents, scalars)
                 masked_logits = model.actor(features) + masks
                 state_values = model.critic(features).squeeze(-1)
+
+                # FORCE 1D SHAPES TO PREVENT SILENT BROADCASTING
+                state_values = state_values.reshape(-1)
+                returns = returns.reshape(-1)
 
                 loss_actor = actor_criterion(masked_logits, actions)
                 loss_critic = critic_criterion(state_values, returns)
