@@ -381,9 +381,9 @@ def main():
     step_checkpoints = glob.glob("checkpoints/ppo_sim_*_step.pth")
     if step_checkpoints:
         latest_cp = max(step_checkpoints, key=lambda x: int(x.split('_')[-2]))
-        print(f"[RESUME] Loading checkpoint: {latest_cp}")
+        print(f"[RESUME] Loading active checkpoint: {latest_cp}")
         checkpoint = torch.load(latest_cp, map_location=PPO_DEVICE)
-        
+
         policy.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         total_timesteps = checkpoint['total_timesteps']
@@ -392,7 +392,19 @@ def main():
         start_update = (total_timesteps // (NUM_ENVS * ROLLOUT_STEPS)) + 1
         print(f"[RESUME] Resuming at global step: {total_timesteps:,}")
     else:
-        print("[INIT] No existing step checkpoints found. Initiating fresh parameters.")
+        # Check for pre-trained joint Behavioral Cloning bootstrapped weights
+        bc_checkpoint_path = "checkpoints/ppo_sim_bc.pth"
+        if os.path.exists(bc_checkpoint_path):
+            print(f"[BOOTSTRAP] Found pre-trained BC model at {bc_checkpoint_path}. Loading parameters...")
+            checkpoint = torch.load(bc_checkpoint_path, map_location=PPO_DEVICE)
+            if 'model_state_dict' in checkpoint:
+                policy.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                policy.load_state_dict(checkpoint)
+            policy_old.load_state_dict(policy.state_dict())
+            print("[BOOTSTRAP] Warm start parameters loaded successfully (Actor & Critic synchronized).")
+        else:
+            print("[INIT] No existing step or BC checkpoints found. Initiating fresh parameters.")
 
     obs, info = envs.reset()
     episode_rewards = np.zeros(NUM_ENVS)

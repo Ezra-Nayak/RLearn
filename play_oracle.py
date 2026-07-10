@@ -59,13 +59,16 @@ def sim_env_step_physics_only(sim_env, action):
     return done
 
 
-def plan_best_action(env, lookahead_steps=12):
+def plan_best_action(env, lookahead_steps=12, sim_env=None):
     """
     Performs real-time time-expanded state-space BFS to find optimal actions.
     Uses cloned simulator transitions to verify paths up to lookahead_steps ahead.
     """
     # Capture current random state to maintain prediction parity
     rand_state = random.getstate()
+
+    if sim_env is None:
+        sim_env = CrossyGymEnv()
 
     def get_env_state_dict(e):
         return {
