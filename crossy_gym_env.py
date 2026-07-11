@@ -347,6 +347,9 @@ class CrossyGymEnv(gym.Env):
         return obs, info
 
     def step(self, action):
+        # Identify if the direct path forward is blocked before movement
+        forward_blocked = self.obstacle_map.get((self.player_x, self.player_z + 1), False)
+
         prev_z = self.player_z
         prev_x = self.player_x
 
@@ -380,8 +383,8 @@ class CrossyGymEnv(gym.Env):
 
         # CAMERA PHYSICS: Apply a constant breeze pushing the balloon forward
         self.camera_z += self.camera_speed * self.DT
-        # Speed up the baseline camera slightly as the agent progresses
-        self.camera_speed = min(2.5, 1.0 + (self.player_z * 0.005))
+        # Speed up the baseline camera slightly as the agent progresses (temporarily set to constant 1)
+        self.camera_speed = 1.0
 
         # Smooth Catchup (Spring/Elastic String centering pull):
         # Target camera position centers the player about 3 rows from the viewport bottom
@@ -415,13 +418,25 @@ class CrossyGymEnv(gym.Env):
             termination_reward = -15.0
 
         # 6. Calculate Reward Shaping
-        # REWARD LOGIC FIX: Lateral movement is no longer rewarded to prevent exploit
+        reward_base = 0.0
+
         if action == 0:
-            reward_base = 0.1  # Forward
-        elif action in [1, 2]:
-            reward_base = -0.01  # Lateral (Slight penalty to encourage forward)
+            reward_base = 0.1  # Base reward for attempting to go forward
+
+        # THE JAILBREAK BONUS:
+        # If blocked by a rock, reward moving Left/Right.
+        # If blocked and idling, apply a penalty to discourage freezing.
+        if forward_blocked:
+            if action in [1, 2] and not obstacle_hit:
+                reward_base = 0.25  # Strategic value for lateral exit
+            elif action == 3:
+                reward_base = -0.15  # Penalty for "giving up" in jail
         else:
-            reward_base = -0.1  # Idle penalty
+            # Normal movement logic
+            if action in [1, 2]:
+                reward_base = -0.02  # Tiny penalty to keep movement purposeful
+            elif action == 3:
+                reward_base = -0.05  # Tiny idle penalty
 
         # Progress Tracking Reward
         reward_progress = 1.0 * (self.player_z - prev_z)

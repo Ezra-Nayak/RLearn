@@ -14,11 +14,12 @@ from play_oracle import plan_best_action, sim_env_step_physics_only
 
 # --- CONFIG ---
 CHECKPOINT_DIR = "checkpoints"
-INPUT_CHECKPOINT = "checkpoints/ppo_sim_9430000_step.pth"
-OUTPUT_CHECKPOINT = "checkpoints/ppo_sim_dagger_aligned.pth"
+DATA_DIR = r"D:\python\RLearn\sim_data"
+INPUT_CHECKPOINT = "checkpoints/ppo_sim_selfplay_v2.pth"
+OUTPUT_CHECKPOINT = "checkpoints/ppo_sim_selfplay_v3.pth"
 TARGET_SAMPLES = 8000
 BATCH_SIZE = 128
-EPOCHS = 30
+EPOCHS = 20
 LEARNING_RATE = 3e-5  # Low learning rate to prevent destroying existing PPO progress
 WEIGHT_DECAY = 1e-5
 
@@ -68,28 +69,43 @@ def restore_env_state(e, s):
     e.active_cars = {z: list(cars) for z, cars in s['active_cars'].items()}
 
 
-def collect_dagger_samples(vae, policy, vae_device, ppo_device, target_samples):
-    print(f"[DAGGER] Collecting {target_samples} targeted correction samples...")
+import concurrent.futures
+
+
+def worker_collect_dagger_trajectory(args):
+    worker_id, beta = args
+    # Load separate CPU instances of the models directly to bypass IPC overhead
+    vae = SpatialVQVAE()
+    vae.load_state_dict(torch.load("checkpoints/sim_vae_best.pth", map_location="cpu", weights_only=False))
+    vae.eval()
+
+    policy = ActorCritic(action_dim=4)
+    checkpoint = torch.load(INPUT_CHECKPOINT, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        policy.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        policy.load_state_dict(checkpoint)
+    policy.eval()
+
     raw_env = CrossyGymEnv()
     env = FrameStackWrapper(raw_env, stack_size=4)
     sim_env_for_planner = CrossyGymEnv()
 
-    samples = []
+    obs, info = env.reset()
+    trajectory_buffer = []
     error_count = 0
     total_steps = 0
 
-    obs, info = env.reset()
-    trajectory_buffer = []
+    # Progressive Cap: Prevent infinite loops if model becomes sufficiently skilled
+    while raw_env.player_z < 100:
+        img_tensor = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
+        scalars_tensor = torch.tensor(obs["scalars"], dtype=torch.float32).unsqueeze(0)
+        masks_tensor = torch.tensor(info["action_mask"], dtype=torch.float32).unsqueeze(0)
 
-    while len(samples) < target_samples:
-        img_tensor = torch.tensor(obs["image"], dtype=torch.float32, device=vae_device).unsqueeze(0)
-        scalars_tensor = torch.tensor(obs["scalars"], dtype=torch.float32, device=ppo_device).unsqueeze(0)
-        masks_tensor = torch.tensor(info["action_mask"], dtype=torch.float32, device=ppo_device).unsqueeze(0)
-
-        # Get PPO model's current spatial representations
+        # Get PPO model's current spatial representations (CPU)
         with torch.no_grad():
             _, _, _, _, _, _, quant_c, quant_t = vae(img_tensor)
-            latents_tensor = torch.cat([quant_c, quant_t], dim=1).to(ppo_device)
+            latents_tensor = torch.cat([quant_c, quant_t], dim=1)
 
             features = policy._get_features(latents_tensor, scalars_tensor)
             action_logits = policy.actor(features) + masks_tensor
@@ -116,46 +132,108 @@ def collect_dagger_samples(vae, policy, vae_device, ppo_device, target_samples):
             if done:
                 fatal_mask[a] = 1.0
 
-        is_error = (ppo_action != oracle_action)
-        if is_error:
+        is_deviation = (ppo_action != oracle_action)
+
+        # Smart Disagreement: Only flag as a CRITICAL error if the agent's action was fatal
+        # or it was a useless idle (when forward/lateral was safe).
+        # We don't penalize safe, valid lateral movement just because the oracle preferred the other side.
+        is_critical_error = is_deviation and (fatal_mask[ppo_action] == 1.0 or (ppo_action == 3 and oracle_action != 3))
+        if is_critical_error:
             error_count += 1
 
-        # Keep 100% of error states, but keep only 20% of correct traversals to prevent bias
-        if is_error or (random.random() < 0.20):
-            trajectory_buffer.append({
-                'latent': latents_tensor.squeeze(0).cpu().numpy(),
-                'scalars': obs["scalars"],
-                'mask': info["action_mask"],
-                'fatal_mask': fatal_mask,
-                'action': oracle_action,
-                'reward': 0.0,  # Computed at terminal
-                'return': 0.0
-            })
+        # KEEP 100% OF TRAJECTORY to maintain the foundational baseline and prevent the "Panic Room" skew
+        trajectory_buffer.append({
+            'latent': latents_tensor.squeeze(0).cpu().numpy(),
+            'scalars': obs["scalars"],
+            'mask': info["action_mask"],
+            'fatal_mask': fatal_mask,
+            'action': oracle_action,  # The oracle is still the ground-truth target
+            'reward': 0.0,
+            'return': 0.0
+        })
 
-        # Execute PPO's action to let it experience its own suboptimal pathing
-        obs, reward, terminated, truncated, info = env.step(ppo_action)
+        # BETA DECAY EXECUTION: Probabilistically choose who drives.
+        # High beta = Expert drives (guides agent to new areas safely).
+        # Low beta = Agent drives (allows it to make mistakes and experience recovery).
+        exec_action = oracle_action if random.random() < beta else ppo_action
+
+        obs, reward, terminated, truncated, info = env.step(exec_action)
         total_steps += 1
 
         if len(trajectory_buffer) > 0:
             trajectory_buffer[-1]['reward'] = reward
 
         if terminated or truncated:
-            # Backcalculate rewards for the collected steps in this trajectory
-            g = 0.0
-            for step in reversed(trajectory_buffer):
-                g = step['reward'] + 0.99 * g
-                step['return'] = g
-                samples.append(step)
-
-            trajectory_buffer = []
-            obs, info = env.reset()
-
-            print(
-                f"\r[DAGGER] Progress: {len(samples)}/{target_samples} samples | captured {error_count} model deviations...",
-                end="")
+            break
 
     env.close()
-    print(f"\n[DAGGER] Collection complete. Disagreement rate: {100.0 * error_count / total_steps:.1f}%")
+
+    # Backcalculate rewards for the collected steps in this trajectory locally
+    g = 0.0
+    for step in reversed(trajectory_buffer):
+        g = step['reward'] + 0.99 * g
+        step['return'] = g
+
+    return trajectory_buffer, error_count, total_steps, raw_env.player_z
+
+
+def collect_dagger_samples(target_samples):
+    print(f"[DAGGER] Spawning parallel workers to harvest {target_samples:,} targeted correction samples...")
+    start_time = time.time()
+
+    samples = []
+    total_errors = 0
+    total_steps = 0
+    episode_scores = []
+    num_workers = max(1, os.cpu_count() - 2)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        active_futures = set()
+
+        # Initial burst
+        for i in range(num_workers * 2):
+            # Beta starts at 0.75 (expert mostly drives) and decays to 0.1 (agent mostly drives)
+            beta = max(0.1, 0.75 - (len(samples) / target_samples))
+            active_futures.add(executor.submit(worker_collect_dagger_trajectory, (i, beta)))
+
+        worker_idx = num_workers * 2
+
+        while len(samples) < target_samples:
+            done, active_futures = concurrent.futures.wait(active_futures,
+                                                           return_when=concurrent.futures.FIRST_COMPLETED)
+
+            for future in done:
+                try:
+                    ep_data, err_cnt, stps, final_score = future.result()
+                    samples.extend(ep_data)
+                    total_errors += err_cnt
+                    total_steps += stps
+                    episode_scores.append(final_score)
+                except Exception as e:
+                    print(f"\n[ERROR] Worker crashed: {e}")
+
+                # Submit another task to maintain the queue. Decay beta based on global progress.
+                beta = max(0.1, 0.75 - (len(samples) / target_samples))
+                active_futures.add(executor.submit(worker_collect_dagger_trajectory, (worker_idx, beta)))
+                worker_idx += 1
+
+            elapsed = time.time() - start_time
+            fps = len(samples) / elapsed if elapsed > 0 else 0
+            print(
+                f"\r[DAGGER] Progress: {len(samples)}/{target_samples} samples | captured {total_errors} model deviations | {fps:.1f} samp/sec...",
+                end="")
+
+        # Cancel remaining tasks to cleanly free up executor threads
+        for future in active_futures:
+            future.cancel()
+
+    samples = samples[:target_samples]
+
+    critical_error_rate = 100.0 * total_errors / total_steps if total_steps > 0 else 0.0
+    avg_score = sum(episode_scores) / len(episode_scores) if episode_scores else 0.0
+    print(
+        f"\n[DAGGER] Collection complete in {(time.time() - start_time) / 60:.2f} minutes.")
+    print(f"[DAGGER] Critical Error Rate: {critical_error_rate:.1f}% | Average End Score: {avg_score:.1f}")
 
     # Normalize returns for value function stability
     returns_arr = np.array([s['return'] for s in samples])
@@ -164,7 +242,7 @@ def collect_dagger_samples(vae, policy, vae_device, ppo_device, target_samples):
     for s in samples:
         s['return'] = (s['return'] - mean_ret) / std_ret
 
-    return samples[:target_samples]
+    return samples
 
 
 def train_dagger():
@@ -186,15 +264,33 @@ def train_dagger():
     print(f"[MODEL] Loading PPO Checkpoint for alignment fine-tuning...")
     model = ActorCritic(action_dim=4).to(device)
 
-    checkpoint = torch.load(INPUT_CHECKPOINT, map_location=device)
+    checkpoint = torch.load(INPUT_CHECKPOINT, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model.load_state_dict(checkpoint)
 
     # Harvest targeted training pairs
-    samples = collect_dagger_samples(vae, model, vae_device, device, TARGET_SAMPLES)
-    dataset = CrossyDaggerDataset(samples)
+    dagger_samples = collect_dagger_samples(TARGET_SAMPLES)
+
+    # AGGREGATION: Load the original BC dataset to prevent catastrophic forgetting
+    bc_data_path = os.path.join(DATA_DIR, "bc_dataset.pt")
+    if os.path.exists(bc_data_path):
+        print(f"[SYSTEM] Loading base BC dataset from {bc_data_path} for True DAgger Aggregation...")
+        bc_samples = torch.load(bc_data_path, map_location='cpu')
+
+        # We cap the BC samples loaded so the new dagger samples make up roughly 35% of the total dataset.
+        random.shuffle(bc_samples)
+        bc_subset = bc_samples[:15000]
+        print(f"[SYSTEM] Combining {len(bc_subset)} BC samples with {len(dagger_samples)} new DAgger samples.")
+
+        combined_samples = bc_subset + dagger_samples
+        random.shuffle(combined_samples)
+    else:
+        print(f"[WARNING] Base BC dataset not found at {bc_data_path}. Training on DAgger samples only.")
+        combined_samples = dagger_samples
+
+    dataset = CrossyDaggerDataset(combined_samples)
 
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size

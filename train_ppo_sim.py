@@ -15,21 +15,23 @@ from torch.distributions import Categorical
 import cv2
 
 # --- HYPERPARAMETERS & CONFIG ---
-LR = 5e-5
+LR_ACTOR = 1e-5         # SURGEON SCALPEL: Ultra-micro LR to protect DAgger policy
+LR_CRITIC = 1e-4        # HIGHER LR: Allow Critic to quickly map the new GAE scale
+TARGET_KL = 0.015       # EMERGENCY BRAKE: Prevents destructive weight updates
+ENTROPY_COEF = 0.005    # STATIC LOW ENTROPY: Prevent chaotic exploration, just slight nudges
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-EPS_CLIP = 0.2
+EPS_CLIP = 0.1          # Tighter clipping for precise weight adjustments
 K_EPOCHS = 4
 HIDDEN_DIM = 512
-NUM_ENVS = 32            # Bounded to maximize VRAM and compute capacity
-ROLLOUT_STEPS = 128      # Batch size per update = NUM_ENVS * ROLLOUT_STEPS (4096 transitions)
+NUM_ENVS = 48
+ROLLOUT_STEPS = 128
 MINIBATCH_SIZE = 64
-CHECKPOINT_INTERVAL = 10000  # Save step checkpoints every N steps
+CHECKPOINT_INTERVAL = 10000
 
 # --- WARMUP CONFIG ---
-# Number of PPO updates where only the Critic is trained.
-# Set to 0 if resuming from a standard PPO checkpoint.
-WARMUP_UPDATES = 15
+# Crucial: Allow Critic to see the new +0.25 rewards before the Actor changes behavior
+WARMUP_UPDATES = 25     # Extended warmup to guarantee Critic stability
 
 VAE_CHECKPOINT = "checkpoints/sim_vae_best.pth"
 
@@ -376,8 +378,12 @@ def main():
     policy = ActorCritic(action_dim=4).to(PPO_DEVICE)
     policy_old = ActorCritic(action_dim=4).to(PPO_DEVICE)
     policy_old.load_state_dict(policy.state_dict())
-    
-    optimizer = torch.optim.Adam(policy.parameters(), lr=LR)
+
+    optimizer = torch.optim.Adam([
+        {'params': policy.actor.parameters(), 'lr': LR_ACTOR},
+        {'params': policy.cnn.parameters(), 'lr': LR_ACTOR},
+        {'params': policy.critic.parameters(), 'lr': LR_CRITIC}
+    ])
     mse_loss_fn = nn.MSELoss()
     buffer = VectorRolloutBuffer(NUM_ENVS, ROLLOUT_STEPS, PPO_DEVICE)
 
@@ -397,8 +403,8 @@ def main():
         start_update = (total_timesteps // (NUM_ENVS * ROLLOUT_STEPS)) + 1
         print(f"[RESUME] Resuming at global step: {total_timesteps:,}")
     else:
-        # Check for pre-trained joint Behavioral Cloning bootstrapped weights
-        bc_checkpoint_path = "checkpoints/ppo_sim_dagger_aligned.pth"
+        # Load the Phase 1 DAgger culmination checkpoint
+        bc_checkpoint_path = "checkpoints/ppo_sim_selfplay_v2.pth"
         if os.path.exists(bc_checkpoint_path):
             print(f"[BOOTSTRAP] Found pre-trained BC model at {bc_checkpoint_path}. Loading parameters...")
             checkpoint = torch.load(bc_checkpoint_path, map_location=PPO_DEVICE)
@@ -499,19 +505,44 @@ def main():
             fadv = (fadv - fadv.mean()) / (fadv.std() + 1e-8)
 
             batch_indices = np.arange(NUM_ENVS * ROLLOUT_STEPS)
-            for _ in range(K_EPOCHS):
+            kl_break = False
+
+            for epoch in range(K_EPOCHS):
                 np.random.shuffle(batch_indices)
+                epoch_kls = []
+
                 for start in range(0, len(batch_indices), MINIBATCH_SIZE):
-                    mb_idx = batch_indices[start : start + MINIBATCH_SIZE]
+                    mb_idx = batch_indices[start: start + MINIBATCH_SIZE]
                     lps, svs, dent = policy.evaluate(fl[mb_idx], fs[mb_idx], fa[mb_idx], fm[mb_idx])
+
                     ratios = torch.exp(lps - flog[mb_idx])
                     surr1 = ratios * fadv[mb_idx]
                     surr2 = torch.clamp(ratios, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP) * fadv[mb_idx]
-                    loss = -torch.min(surr1, surr2).mean() + 0.5 * mse_loss_fn(svs.squeeze(-1), fret[mb_idx]) - max(0.01, 0.05 - (update / 10000) * 0.04) * dent.mean()
+
+                    loss_pi = -torch.min(surr1, surr2).mean()
+                    loss_v = 0.5 * mse_loss_fn(svs.squeeze(-1), fret[mb_idx])
+
+                    # Static Low Entropy: We want to preserve pathing, just micro-explore
+                    loss_ent = ENTROPY_COEF * dent.mean()
+
+                    loss = loss_pi + loss_v - loss_ent
+
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
                     optimizer.step()
+
+                    with torch.no_grad():
+                        approx_kl = (flog[mb_idx] - lps).mean().item()
+                        epoch_kls.append(approx_kl)
+
+                avg_epoch_kl = np.mean(epoch_kls)
+                # KL Divergence check: Only check if Actor is actually being updated (not Warmup)
+                if not is_warmup and avg_epoch_kl > TARGET_KL:
+                    print(
+                        f"      [!] KL Overload ({avg_epoch_kl:.4f} > {TARGET_KL}). Early stopping epoch {epoch + 1}/{K_EPOCHS} to protect policy.")
+                    kl_break = True
+                    break
 
             policy_old.load_state_dict(policy.state_dict())
             buffer.reset()

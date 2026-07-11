@@ -15,6 +15,7 @@ from play_oracle import plan_best_action, sim_env_step_physics_only
 
 # --- CONFIG ---
 CHECKPOINT_DIR = "checkpoints"
+DATA_DIR = r"D:\python\RLearn\sim_data"
 TARGET_STEPS = 15000
 BATCH_SIZE = 128
 EPOCHS = 25  # Increased training epochs from 15 to 25
@@ -226,7 +227,15 @@ def train_behavioral_cloning():
         param.requires_grad = False
 
     # Gather via parallel pool
+    os.makedirs(DATA_DIR, exist_ok=True)
+    bc_data_path = os.path.join(DATA_DIR, "bc_dataset.pt")
+
+    # Gather via parallel pool
     samples = gather_expert_samples(vae, vae_device, TARGET_STEPS)
+
+    print(f"[SYSTEM] Saving BC dataset to {bc_data_path} for future DAgger aggregation...")
+    torch.save(samples, bc_data_path)
+
     full_dataset = CrossyExpertDataset(samples)
 
     train_size = int(0.9 * len(full_dataset))

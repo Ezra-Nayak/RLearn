@@ -157,14 +157,40 @@ A high-throughput, joint policy-value supervised pretraining suite (Behavioral C
 * **Warm Start Resuming**: Generates the initialized checkpoint `checkpoints/ppo_sim_bc.pth`. When standard vectorized PPO is executed, the core loop detects and loads these weights to bootstrap training performance.
 
 ### `decode_ppo_sim.py`
-A diagnostics tool that serves as a simulated fMRI brain scanner for your trained agent.
-* **Attention Saliency Maps**: Performs backpropagation from the actor's strongest decision logit back to the VAE's spatial latents, constructing a real-time attention heatmap showing what visual patterns the model is focused on.
-* **Interactive Synaptic Connectivity Graph**: Downsamples the actor's high-dimensional linear weights and layer activations into a simplified $8 \to 12 \to 12 \to 4$ node layout. Connection pathways are rendered as Bézier curves with thicknesses and colors (Cyan for positive activations, Magenta for negative ones) indicating relative signal strength.
-* **Recordings**: Step decisions, critic value estimations, and policy distributions are compiled and saved directly to disk as diagnostic frame logs.
+A legacy diagnostics tool providing a 4-quadrant view of neural saliency and synaptic connectivity.
+
+### `train_dagger.py`
+An Active DAgger (Dataset Aggregation) loop used to align PPO checkpoints with Oracle expert knowledge.
+* **Targeted Error Correction**: Runs the current PPO model through the environment, but queries the Oracle at every step. If the model disagrees with the expert, the state is recorded for fine-tuning.
+* **Non-Fatal Exploration**: Forces the agent into sub-optimal but surviving positions to teach "recovery" logic, preventing the agent from "freaking out" when it deviates from a perfect path.
+
+### `diagnose_agent.py`
+A high-fidelity 1080p diagnostic HUD for deep agent inspection.
+* **Ghost Oracle Integration**: Spawns a translucent "Shadow Chicken" in the same environment, showing the Oracle's optimal real-time pathing alongside the PPO agent's live decisions.
+* **Vector Probability HUD**: Renders neon-glowing arrows stemming from the player that scale in length and thickness based on the Actor's output logits.
+* **Saliency Laser Sweeps**: Projects orange laser lines from the player to the specific hazard (car/rock) currently dominating the neural attention mechanism.
+* **Threat Index & Biometrics**: Displays a real-time Critic "Threat" bar and valuation timeline.
 
 ---
 
-## 3. Project Configuration & Parameters
+## 3. Advanced Training Methodologies
+
+### Value Function Warmup
+To prevent "Exploration Shock" when loading pre-trained weights (BC/DAgger) into PPO, the pipeline supports a **Warmup Phase**. During this phase (defined by `WARMUP_UPDATES`), the Actor's parameters are frozen. This allows the Critic to calibrate its Value estimations and GAE calculations to the environment's actual reward scale before the Actor begins making gradient-based changes, preventing catastrophic policy degradation.
+
+### Potential-Based Reward Shaping (The Jailbreak Bonus)
+Standard sparse rewards (e.g., `+1` for progress) often lead to "Obstacle Jail" where an agent gets stuck behind a rock. The environment implements shaping logic to break these plateaus:
+* **Forward Blocked Multiplier**: If the path forward is blocked, the agent receives a `+0.25` reward for moving laterally (Left/Right) and a `-0.15` penalty for Idling. This effectively teaches the Critic that "sliding" around hazards is more valuable than waiting.
+
+### The Infinity Agent Roadmap
+Building a master-level agent involves three distinct curriculum phases:
+1. **The Academy (Supervised)**: Iterative BC and Self-Play DAgger loops to build a foundation that mimics expert BFS pathing.
+2. **The Holodeck (Environment)**: Introducing stochastic car speeds and obstacle densities in the simulator to force generalization.
+3. **The Grandmaster (Reinforcement)**: Asymptotic PPO refinement using hyperparameter annealing and micro-learning rates to polish the agent's survival instincts.
+
+---
+
+## 4. Project Configuration & Parameters
 
 The table below outlines the default training configurations and data structures used across the simulation pipeline:
 
@@ -172,15 +198,15 @@ The table below outlines the default training configurations and data structures
 | :--- | :--- | :--- | :--- |
 | **Global Pipeline** | `NUM_ENVS` | `32` | Scales visual execution batches on DirectML GPU |
 | **Global Pipeline** | `ROLLOUT_STEPS` | `128` | Timesteps collected per environment before PPO updates |
-| **Global Pipeline** | `MINIBATCH_SIZE` | `64` | Sub-sample size for policy optimization epochs |
-| **CrossyGymEnv** | State Dimension | `Dict("image", "scalars")` | Exact observation structures passed to wrappers |
+| **PPO Fine-Tuning** | `LR` | `2e-5` to `5e-5` | Micro-learning rate for post-DAgger refinement |
+| **PPO Fine-Tuning** | `WARMUP_UPDATES` | `10 - 15` | Updates where Actor is frozen for Critic calibration |
+| **PPO Fine-Tuning** | `EPS_CLIP` | `0.1` | Tighter clipping for policy stability |
+| **CrossyGymEnv** | `Jailbreak Bonus` | `+0.25` | Reward for lateral movement when forward is blocked |
 | **CrossyGymEnv** | `self.GRID_MIN_X` / `GRID_MAX_X` | `[-4, 4]` | Logical lateral limits of the grid |
 | **CrossyGymEnv** | `self.camera_speed` | `1.0` (scaled to `2.5` max) | Progression rate of the trailing death line |
 | **FrameStackWrapper** | Output Shape | `(4, 160, 160)` | Stacked historical frame format for visual encoding |
 | **SpatialVQVAE** | Latent Output Shape | `(128, 20, 20)` | Concatenated spatial context and trend embeddings |
-| **SpatialVQVAE** | Codebook Size | `512` embeddings of `64` dim | Discretized representation capacity of each head |
 | **ActorCritic** | Conv Layer Input | `130` channels | 128 VAE channels + 2 coordinate grids (CoordConv) |
 | **ActorCritic** | Output Layer | `4` discrete logits | [Up, Left, Right, Idle] action choices |
 | **play_oracle.py** | `lookahead_steps` | `12` | Planning horizon depth for optimal pathing decisions |
-| **train_bc.py** | `TARGET_STEPS` | `15,000` | Sample threshold of optimal transitions collected in memory |
-| **train_bc.py** | `EPOCHS` | `25` | Supervised training epochs for policy-value bootstrapping |
+| **train_dagger.py** | `TARGET_SAMPLES` | `8,000` | Error-focused corrective transitions for alignment |
