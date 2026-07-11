@@ -1,6 +1,7 @@
 # --- train_bc.py ---
 import os
 import time
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,7 +11,7 @@ import concurrent.futures
 
 from crossy_gym_env import CrossyGymEnv
 from train_ppo_sim import FrameStackWrapper, SpatialVQVAE, ActorCritic, setup_device
-from play_oracle import plan_best_action
+from play_oracle import plan_best_action, sim_env_step_physics_only
 
 # --- CONFIG ---
 CHECKPOINT_DIR = "checkpoints"
@@ -34,14 +35,42 @@ class CrossyExpertDataset(Dataset):
             torch.FloatTensor(s['latent']),
             torch.FloatTensor(s['scalars']),
             torch.FloatTensor(s['mask']),
+            torch.FloatTensor(s['fatal_mask']),
             torch.tensor(s['action'], dtype=torch.long),
             torch.tensor(s['return'], dtype=torch.float32)
         )
 
 
+def get_env_state_dict(e):
+    return {
+        'player_x': e.player_x,
+        'player_z': e.player_z,
+        'camera_z': e.camera_z,
+        'camera_speed': e.camera_speed,
+        'highest_generated_z': e.highest_generated_z,
+        'terrain_map': e.terrain_map.copy(),
+        'obstacle_map': e.obstacle_map.copy(),
+        'road_parameters': e.road_parameters.copy(),
+        'active_cars': {z: list(cars) for z, cars in e.active_cars.items()}
+    }
+
+
+def restore_env_state(e, s):
+    e.player_x = s['player_x']
+    e.player_z = s['player_z']
+    e.camera_z = s['camera_z']
+    e.camera_speed = s['camera_speed']
+    e.highest_generated_z = s['highest_generated_z']
+    e.terrain_map = s['terrain_map'].copy()
+    e.obstacle_map = s['obstacle_map'].copy()
+    e.road_parameters = s['road_parameters'].copy()
+    e.active_cars = {z: list(cars) for z, cars in s['active_cars'].items()}
+
+
 def worker_collect_trajectory(worker_id):
     """
     Independent worker process that collects a single raw oracle trajectory.
+    Uses DAgger-style exploration to visit 'flawed' scenarios and explicitly label fatal actions.
     """
     raw_env = CrossyGymEnv()
     env = FrameStackWrapper(raw_env, stack_size=4)
@@ -53,14 +82,46 @@ def worker_collect_trajectory(worker_id):
     while raw_env.player_z < 100:
         action = plan_best_action(raw_env, lookahead_steps=12, sim_env=sim_env_for_planner)
 
+        # Calculate fatal mask to teach the agent what NOT to do
+        fatal_mask = np.zeros(4, dtype=np.float32)
+        start_state = get_env_state_dict(raw_env)
+
+        for a in [0, 1, 2, 3]:
+            # Mask out of bounds as fatal
+            if a == 1 and raw_env.player_x <= raw_env.GRID_MIN_X:
+                fatal_mask[a] = 1.0
+                continue
+            elif a == 2 and raw_env.player_x >= raw_env.GRID_MAX_X:
+                fatal_mask[a] = 1.0
+                continue
+
+            rand_state = random.getstate()
+            restore_env_state(sim_env_for_planner, start_state)
+            done = sim_env_step_physics_only(sim_env_for_planner, a)
+            random.setstate(rand_state)
+
+            if done:
+                fatal_mask[a] = 1.0
+
         ep_data.append({
             'image': obs["image"],  # Shape: (4, 160, 160)
             'scalars': obs["scalars"],
             'mask': info["action_mask"],
+            'fatal_mask': fatal_mask,
             'action': action
         })
 
-        obs, reward, terminated, truncated, info = env.step(action)
+        # DAgger: 20% of the time, take a valid but sub-optimal action to create "flawed" recovery scenarios
+        if random.random() < 0.20:
+            valid_flawed_actions = [a for a in [0, 1, 2, 3] if fatal_mask[a] == 0.0 and a != action]
+            if valid_flawed_actions:
+                exec_action = random.choice(valid_flawed_actions)
+            else:
+                exec_action = action
+        else:
+            exec_action = action
+
+        obs, reward, terminated, truncated, info = env.step(exec_action)
         ep_data[-1]['reward'] = reward
 
         if terminated or truncated:
@@ -129,6 +190,7 @@ def gather_expert_samples(vae, vae_device, target_steps):
                 'latent': latents_batch[j],
                 'scalars': s['scalars'],
                 'mask': s['mask'],
+                'fatal_mask': s['fatal_mask'],
                 'action': s['action'],
                 'return': s['return']
             })
@@ -191,10 +253,11 @@ def train_behavioral_cloning():
         correct_train = 0
         total_train = 0
 
-        for latents, scalars, masks, actions, returns in train_loader:
+        for latents, scalars, masks, fatal_masks, actions, returns in train_loader:
             latents = latents.to(device)
             scalars = scalars.to(device)
             masks = masks.to(device)
+            fatal_masks = fatal_masks.to(device)
             actions = actions.to(device)
             returns = returns.to(device)
 
@@ -224,7 +287,12 @@ def train_behavioral_cloning():
 
             loss_actor = actor_criterion(masked_logits, actions)
             loss_critic = critic_criterion(state_values, returns)
-            loss = loss_actor + 0.5 * loss_critic
+
+            # Explicitly penalize the network for predicting actions that lead to immediate death
+            action_probs = torch.softmax(action_logits, dim=-1)
+            fatal_penalty = torch.mean(torch.sum(action_probs * fatal_masks, dim=-1))
+
+            loss = loss_actor + 0.5 * loss_critic + 2.0 * fatal_penalty
 
             loss.backward()
             optimizer.step()
@@ -244,12 +312,14 @@ def train_behavioral_cloning():
         total_val = 0
 
         with torch.no_grad():
-            for latents, scalars, masks, actions, returns in val_loader:
-                latents, scalars, masks, actions, returns = (
-                    latents.to(device), scalars.to(device), masks.to(device), actions.to(device), returns.to(device)
+            for latents, scalars, masks, fatal_masks, actions, returns in val_loader:
+                latents, scalars, masks, fatal_masks, actions, returns = (
+                    latents.to(device), scalars.to(device), masks.to(device), fatal_masks.to(device),
+                    actions.to(device), returns.to(device)
                 )
                 features = model._get_features(latents, scalars)
-                masked_logits = model.actor(features) + masks
+                action_logits = model.actor(features)
+                masked_logits = action_logits + masks
                 state_values = model.critic(features).squeeze(-1)
 
                 # FORCE 1D SHAPES TO PREVENT SILENT BROADCASTING
@@ -258,7 +328,11 @@ def train_behavioral_cloning():
 
                 loss_actor = actor_criterion(masked_logits, actions)
                 loss_critic = critic_criterion(state_values, returns)
-                loss = loss_actor + 0.5 * loss_critic
+
+                action_probs = torch.softmax(action_logits, dim=-1)
+                fatal_penalty = torch.mean(torch.sum(action_probs * fatal_masks, dim=-1))
+
+                loss = loss_actor + 0.5 * loss_critic + 2.0 * fatal_penalty
                 val_loss += loss.item()
 
                 _, predicted = torch.max(masked_logits, 1)
