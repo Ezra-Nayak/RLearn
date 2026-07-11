@@ -15,7 +15,7 @@ from torch.distributions import Categorical
 import cv2
 
 # --- HYPERPARAMETERS & CONFIG ---
-LR = 3e-4
+LR = 5e-5
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 EPS_CLIP = 0.2
@@ -25,6 +25,11 @@ NUM_ENVS = 32            # Bounded to maximize VRAM and compute capacity
 ROLLOUT_STEPS = 128      # Batch size per update = NUM_ENVS * ROLLOUT_STEPS (4096 transitions)
 MINIBATCH_SIZE = 64
 CHECKPOINT_INTERVAL = 10000  # Save step checkpoints every N steps
+
+# --- WARMUP CONFIG ---
+# Number of PPO updates where only the Critic is trained.
+# Set to 0 if resuming from a standard PPO checkpoint.
+WARMUP_UPDATES = 15
 
 VAE_CHECKPOINT = "checkpoints/sim_vae_best.pth"
 
@@ -393,7 +398,7 @@ def main():
         print(f"[RESUME] Resuming at global step: {total_timesteps:,}")
     else:
         # Check for pre-trained joint Behavioral Cloning bootstrapped weights
-        bc_checkpoint_path = "checkpoints/ppo_sim_bc.pth"
+        bc_checkpoint_path = "checkpoints/ppo_sim_dagger_aligned.pth"
         if os.path.exists(bc_checkpoint_path):
             print(f"[BOOTSTRAP] Found pre-trained BC model at {bc_checkpoint_path}. Loading parameters...")
             checkpoint = torch.load(bc_checkpoint_path, map_location=PPO_DEVICE)
@@ -413,7 +418,23 @@ def main():
     try:
         for update in range(start_update, 1000000):
             update_start = time.time()
-            
+
+            # --- VALUE FUNCTION WARMUP LOGIC ---
+            # If we are in the warmup phase, freeze the Actor to protect
+            # pre-trained weights while the Critic calibrates.
+            is_warmup = update < (start_update + WARMUP_UPDATES)
+            if is_warmup:
+                for param in policy.actor.parameters():
+                    param.requires_grad = False
+                # Optional: Ensure CNN stays frozen if it's part of the pre-trained features
+                for param in policy.cnn.parameters():
+                    param.requires_grad = False
+            else:
+                for param in policy.actor.parameters():
+                    param.requires_grad = True
+                for param in policy.cnn.parameters():
+                    param.requires_grad = True
+
             for _ in range(ROLLOUT_STEPS):
                 total_timesteps += NUM_ENVS
                 
@@ -497,9 +518,11 @@ def main():
 
             it_fps = (NUM_ENVS * ROLLOUT_STEPS) / (time.time() - update_start)
             avg_fps = it_fps if avg_fps == 0.0 else (0.9 * avg_fps) + (0.1 * it_fps)
-            avg_score = sum(rolling_scores)/len(rolling_scores) if rolling_scores else 0
-            
-            print(f"Update: {update} | Steps: {total_timesteps:,} | FPS: {avg_fps:.1f} | Avg Score: {avg_score:.2f} | Best: {best_score}")
+            avg_score = sum(rolling_scores) / len(rolling_scores) if rolling_scores else 0
+
+            warmup_status = "[WARMUP]" if is_warmup else ""
+            print(
+                f"Update: {update} {warmup_status} | Steps: {total_timesteps:,} | FPS: {avg_fps:.1f} | Avg Score: {avg_score:.2f} | Best: {best_score}")
 
     except KeyboardInterrupt:
         print("\n[!] Shutdown: Saving current state...")
