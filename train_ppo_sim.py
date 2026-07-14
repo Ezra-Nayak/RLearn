@@ -15,11 +15,11 @@ from torch.distributions import Categorical
 import cv2
 
 # --- HYPERPARAMETERS & CONFIG ---
-LR_ACTOR = 1e-5         # SURGEON SCALPEL: Ultra-micro LR to protect DAgger policy
+LR_ACTOR = 8e-6         # EXTREME SCALPEL: Half the LR to stop KL Overload thrashing
 LR_CRITIC = 1e-4        # HIGHER LR: Allow Critic to quickly map the new GAE scale
-TARGET_KL = 0.015       # EMERGENCY BRAKE: Prevents destructive weight updates
-ENTROPY_COEF = 0.005    # STATIC LOW ENTROPY: Prevent chaotic exploration, just slight nudges
-GAMMA = 0.99
+TARGET_KL = 0.025       # RELAXED BRAKE: Allow the network a bit more room to breathe before aborting
+ENTROPY_COEF = 0.002    # ALMOST ZERO: Stop the agent from exploring stupid moves, rely on mastery
+GAMMA = 0.998           # EAGLE EYE: Expands the Critic's planning horizon to ~500 steps (50 rows)
 GAE_LAMBDA = 0.95
 EPS_CLIP = 0.1          # Tighter clipping for precise weight adjustments
 K_EPOCHS = 4
@@ -28,6 +28,9 @@ NUM_ENVS = 48
 ROLLOUT_STEPS = 128
 MINIBATCH_SIZE = 64
 CHECKPOINT_INTERVAL = 10000
+
+# Targeted Model to Fine-Tune (The Grandmaster baseline)
+TARGET_MODEL = "checkpoints/ppo_redemption_latest.pth"
 
 # --- WARMUP CONFIG ---
 # Crucial: Allow Critic to see the new +0.25 rewards before the Actor changes behavior
@@ -403,19 +406,18 @@ def main():
         start_update = (total_timesteps // (NUM_ENVS * ROLLOUT_STEPS)) + 1
         print(f"[RESUME] Resuming at global step: {total_timesteps:,}")
     else:
-        # Load the Phase 1 DAgger culmination checkpoint
-        bc_checkpoint_path = "checkpoints/ppo_sim_selfplay_v2.pth"
-        if os.path.exists(bc_checkpoint_path):
-            print(f"[BOOTSTRAP] Found pre-trained BC model at {bc_checkpoint_path}. Loading parameters...")
-            checkpoint = torch.load(bc_checkpoint_path, map_location=PPO_DEVICE)
-            if 'model_state_dict' in checkpoint:
+        # Load the Target Model culmination checkpoint
+        if os.path.exists(TARGET_MODEL):
+            print(f"[BOOTSTRAP] Found pre-trained Grandmaster model at {TARGET_MODEL}. Loading parameters...")
+            checkpoint = torch.load(TARGET_MODEL, map_location=PPO_DEVICE)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 policy.load_state_dict(checkpoint['model_state_dict'])
             else:
                 policy.load_state_dict(checkpoint)
             policy_old.load_state_dict(policy.state_dict())
             print("[BOOTSTRAP] Warm start parameters loaded successfully (Actor & Critic synchronized).")
         else:
-            print("[INIT] No existing step or BC checkpoints found. Initiating fresh parameters.")
+            print(f"[INIT] Target model {TARGET_MODEL} not found. Initiating fresh parameters.")
 
     obs, info = envs.reset()
     episode_rewards = np.zeros(NUM_ENVS)

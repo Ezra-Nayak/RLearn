@@ -159,6 +159,23 @@ A high-throughput, joint policy-value supervised pretraining suite (Behavioral C
 ### `decode_ppo_sim.py`
 A legacy diagnostics tool providing a 4-quadrant view of neural saliency and synaptic connectivity.
 
+### `decode_ppo_sim_v2.py`
+A highly stylized, cinematic fMRI diagnostic dashboard ("Cyberpunk Scanner") for real-time inspection of the agent's decision-making process.
+* **Latent Space & Codebook Visualization**: Renders the raw input frame alongside the VAE reconstruction with a JET-colormap saliency overlay.
+* **Cyber-Synaptic Flow Graph**: Dynamically visualizes the policy's Actor MLP layers using drooping Bezier curves. It traces the active neural pathways backward from the *predicted next move*.
+
+### `train_redemption_idle.py`
+The "Patience Patch" variant of the redemption loop. It utilizes the `PatienceCurriculumEnv` to force the agent into 1-wide choke points against high-density traffic. It specifically harvests trajectories where the Oracle demonstrates `Idle` as the only surviving action, mixing them into the BC foundation to cure "Impatience Syndrome."
+
+### `visual_scenarios_evaluate.py`
+An interactive evaluation sandbox. Allows a human tester to toggle between specific challenge scenarios (*Grass Navigation, Simple Roads, Complex Traffic, Obstacle Jailbreak*) in real-time using keys 1-4 to observe how specific weight updates affect different cognitive skills.
+
+### `verify_canvas_black_bar.py`
+A diagnostic utility that analyzes the `.npy` dataset for "Visual Dead Zones." It identified that the top 30 rows of the 160x160 canvas were unused, allowing for a vertical viewport shift to recover 18.75% of the VAE's latent reconstruction capacity.
+
+### `refresh_expert_data.py`
+A high-throughput, parallelized expert data harvester. Unlike `collect_sim_data.py`, this uses a `ProcessPoolExecutor` to saturate CPU cores, generating 20,000+ deterministic expert transitions for Behavioral Cloning in minutes.
+
 ### `train_dagger.py`
 An Active DAgger (Dataset Aggregation) loop used to align PPO checkpoints with Oracle expert knowledge.
 * **Targeted Error Correction**: Runs the current PPO model through the environment, but queries the Oracle at every step. If the model disagrees with the expert, the state is recorded for fine-tuning.
@@ -170,6 +187,21 @@ A high-fidelity 1080p diagnostic HUD for deep agent inspection.
 * **Vector Probability HUD**: Renders neon-glowing arrows stemming from the player that scale in length and thickness based on the Actor's output logits.
 * **Saliency Laser Sweeps**: Projects orange laser lines from the player to the specific hazard (car/rock) currently dominating the neural attention mechanism.
 * **Threat Index & Biometrics**: Displays a real-time Critic "Threat" bar and valuation timeline.
+
+### `train_redemption.py`
+Implements a hindsight alternate-timeline loop designed to correct the specific tactical errors that cause agent failure.
+* **Time-Travel Rollbacks**: Runs the active policy until death is triggered. Upon elimination, the system rewinds the exact physics state of the simulator 12 steps backward, hands control to the Oracle pathfinder, and records the alternate timeline where the hazard is successfully navigated.
+* **Forgetting Prevention**: Blends the corrective trajectories with a foundational corpus of historical Behavioral Cloning (BC) expert samples (e.g., a 10,000-sample baseline). This mixed dataset is used to fine-tune the Actor-Critic network, preventing catastrophic forgetting of standard driving behaviors.
+
+### `evaluate_model.py`
+A standardized diagnostic benchmark suite for evaluating agent behavior across isolated challenges.
+* **Deterministic Sandbox Scenarios**: Temporarily overrides the environment's chunk generator to build highly specific test arenas including *Grass Navigation* (maze-solving under high obstacle density), *Simple Roads* (basic traffic crossing), *Complex Traffic* (fast, multi-lane highways), and *Obstacle Jailbreak* (forcing immediate lateral escapes).
+* **Quantitative Report Generation**: Aggregates pass rates, average speed to clear the target line, and logs explicit failure categories—breaking down deaths into car collisions, camera-creep (eagle) deaths, or timeouts.
+
+### `train_ppo_curriculum.py`
+A targeted reinforcement learning loop utilizing curriculum-shifted generation distributions to train spatial intelligence.
+* **Environment Distribution Shift**: Overrides procedural generation in `CurriculumCrossyEnv` to dynamically spawn dense grass mazes (up to 28% obstacle density) and lateral jailbreak configurations 60% of the time.
+* **Forgiving Camera Speed**: Locks camera progression strictly to a constant speed of 1.0. This allows the policy sufficient time to discover sideways navigation maneuvers and plan escape paths out of tight rock clusters without being immediately run over by the camera.
 
 ---
 
@@ -196,17 +228,17 @@ The table below outlines the default training configurations and data structures
 
 | Module / Class | Setting | Parameter / Shape | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Global Pipeline** | `NUM_ENVS` | `32` | Scales visual execution batches on DirectML GPU |
-| **Global Pipeline** | `ROLLOUT_STEPS` | `128` | Timesteps collected per environment before PPO updates |
-| **PPO Fine-Tuning** | `LR` | `2e-5` to `5e-5` | Micro-learning rate for post-DAgger refinement |
-| **PPO Fine-Tuning** | `WARMUP_UPDATES` | `10 - 15` | Updates where Actor is frozen for Critic calibration |
-| **PPO Fine-Tuning** | `EPS_CLIP` | `0.1` | Tighter clipping for policy stability |
-| **CrossyGymEnv** | `Jailbreak Bonus` | `+0.25` | Reward for lateral movement when forward is blocked |
-| **CrossyGymEnv** | `self.GRID_MIN_X` / `GRID_MAX_X` | `[-4, 4]` | Logical lateral limits of the grid |
-| **CrossyGymEnv** | `self.camera_speed` | `1.0` (scaled to `2.5` max) | Progression rate of the trailing death line |
-| **FrameStackWrapper** | Output Shape | `(4, 160, 160)` | Stacked historical frame format for visual encoding |
-| **SpatialVQVAE** | Latent Output Shape | `(128, 20, 20)` | Concatenated spatial context and trend embeddings |
-| **ActorCritic** | Conv Layer Input | `130` channels | 128 VAE channels + 2 coordinate grids (CoordConv) |
-| **ActorCritic** | Output Layer | `4` discrete logits | [Up, Left, Right, Idle] action choices |
-| **play_oracle.py** | `lookahead_steps` | `12` | Planning horizon depth for optimal pathing decisions |
-| **train_dagger.py** | `TARGET_SAMPLES` | `8,000` | Error-focused corrective transitions for alignment |
+| **PPO Fine-Tuning** | `LR_ACTOR` | `8e-6` | "Extreme Scalpel" rate to stop KL-thrashing |
+| **PPO Fine-Tuning** | `GAMMA` | `0.998` | "Eagle Eye" horizon; pushes vision to 50+ rows |
+| **PPO Fine-Tuning** | `ENTROPY_COEF` | `0.002` | Minimal exploration to protect Grandmaster instincts |
+| **PPO Fine-Tuning** | `TARGET_KL` | `0.025` | Relaxed brake to allow meaningful policy shifts |
+| **Redemption** | `BC_MIX_RATIO` | `10,000` | Anchor samples to prevent catastrophic forgetting |
+| **Curriculum** | `camera_speed` | `0.5` | Forgiving camera for "Patience" training |
+
+---
+
+## 5. Current Agent State: 
+
+Over hours and millions of steps of training and teaching, i crafted ppo_redemption_latest.pth which went through the entire BC pipeline: train_bc.py, train_dagger.py, train_ppo_curriculum.py, train_redemption.py. it is excellent, can definitely say with confidence that there is generalised intelligence here. however, the one thing it struggles with is knowing when to idle. sometimes, it gets into a tricky traffic situation where the only way to survive is idle for a few steps till the car infront passes by for an opening. but instead, it just runs into the car. note that when it's not surrounded by cars, it wont face an issue, it will easily pass it by going left/right around the car. When this is not an option, it runs into a car headfirst.
+train_redemption_idle.py was created to solve this, but failed. it just lobotomised the agent by making the genralised intelligence of ppo_redemption_latest dissapear. 
+Ofcourse, planning is also an issue. tthe agent reacts very well to the lane area right in front of the chicken. not much planning can be observed.
